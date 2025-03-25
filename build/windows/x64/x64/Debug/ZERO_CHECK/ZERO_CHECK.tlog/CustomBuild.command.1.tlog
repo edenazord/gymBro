@@ -1,0 +1,10 @@
+^C:\USERS\FILIP\DOCUMENTS\PROGETTI\GYMBRO\BUILD\WINDOWS\X64\CMAKEFILES\741F9E7CAC27D67A301A43A84D9555F3\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" -SC:/Users/filip/Documents/Progetti/gymBro/windows -BC:/Users/filip/Documents/Progetti/gymBro/build/windows/x64 --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/Users/filip/Documents/Progetti/gymBro/build/windows/x64/gym_training_app.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

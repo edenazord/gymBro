@@ -1,0 +1,2 @@
+C:/Users/filip/Documents/Progetti/gymBro/android/app/.cxx/Debug/62363y42/armeabi-v7a/CMakeFiles/edit_cache.dir
+C:/Users/filip/Documents/Progetti/gymBro/android/app/.cxx/Debug/62363y42/armeabi-v7a/CMakeFiles/rebuild_cache.dir

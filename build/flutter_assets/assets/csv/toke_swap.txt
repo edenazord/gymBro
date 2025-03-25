@@ -1,0 +1,1082 @@
+import time
+import requests
+import tkinter as tk
+from tkinter import ttk, messagebox
+import mysql.connector
+from datetime import datetime
+import json
+import logging
+import base64
+import os
+import base58
+from typing import Optional
+
+# Libreria solders (versione aggiornata che supporta VersionedTransaction)
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.message import MessageV0
+from solders.instruction import Instruction
+from solders.system_program import TransferParams, transfer
+from solders.transaction import Transaction,VersionedTransaction
+from solders.signature import Signature
+from solders.hash import Hash
+
+# == PARAMETRI DI CONNESSIONE MYSQL ==
+DB_HOST = "localhost"
+DB_USER = "root"
+DB_PASSWORD = ""
+DB_NAME = "trading_bot"
+
+# == CONFIGURAZIONE SOLANA ==
+RPC_URL = "https://api.mainnet-beta.solana.com/"  # Cambia se necessario
+PRIVATE_KEY_STRING = "5pDc2pNRoxDqMfM5D6K4rmy3QRGFq9cPLEUwvvwuAYmVvqTea7ji1VLFRC3m8X12hTYhwQJGJLrhkWwyvVtNSv35"
+WALLET_ADDRESS = "FshT5PnWY4vQGSvp4uEgRWThPFZkgCiS9R458qnAz2hy"
+
+# Configurazione del logger
+logging.basicConfig(
+    filename='trading_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+try:
+    # Keypair da solders
+    sender = Keypair.from_base58_string(PRIVATE_KEY_STRING)
+    logging.info("Keypair inizializzato correttamente (solders).")
+except Exception as e:
+    logging.error(f"Errore nell'inizializzazione del Keypair: {e}")
+    raise ValueError("Chiave privata non valida. Assicurati di fornire una chiave valida.")
+
+monitored_tokens = {}
+seen_tokens = set()
+first_run = True
+
+# --------------------------------------------------
+#        FUNZIONI DI CONNESSIONE/DB
+# --------------------------------------------------
+
+def connect_db():
+    try:
+        conn = mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            database=DB_NAME
+        )
+        return conn
+    except mysql.connector.Error as err:
+        logging.error(f"Errore di connessione al DB: {err}")
+        messagebox.showerror("Errore DB", f"Errore di connessione al DB: {err}")
+        return None
+
+def initialize_db():
+    conn = connect_db()
+    if not conn:
+        return
+    cursor = conn.cursor()
+
+    # Tabella top10
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS top10 (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            token_name VARCHAR(255) NOT NULL,
+            price DOUBLE NOT NULL,
+            best_route VARCHAR(255),
+            is_new TINYINT(1) DEFAULT 0,
+            address VARCHAR(255),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Tabella top10_history
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS top10_history (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            token_name VARCHAR(255) NOT NULL,
+            price DOUBLE NOT NULL,
+            address VARCHAR(255),
+            is_active TINYINT(1) DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Tabella monitored_tokens
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS monitored_tokens (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            token_name VARCHAR(255) NOT NULL,
+            entry_price DOUBLE NOT NULL,
+            current_price DOUBLE NOT NULL,
+            stoploss DOUBLE NOT NULL,
+            status VARCHAR(10) DEFAULT 'open',
+            max_price DOUBLE DEFAULT 0,
+            close_gain_loss DOUBLE DEFAULT 0,
+            mint_address VARCHAR(255),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+
+    # Aggiungi la colonna 'mint_address' se non esiste
+    try:
+        cursor.execute("""
+            ALTER TABLE monitored_tokens
+            ADD COLUMN mint_address VARCHAR(255)
+        """)
+        conn.commit()
+        logging.info("Colonna 'mint_address' aggiunta con successo.")
+    except mysql.connector.Error as err:
+        if err.errno == 1060:
+            logging.info("La colonna 'mint_address' esiste già.")
+        else:
+            logging.error(f"Errore aggiunta colonna 'mint_address': {err}")
+
+    cursor.close()
+    conn.close()
+
+# --------------------------------------------------
+# FUNZIONI PER TABELLA top10
+# --------------------------------------------------
+
+def clear_top10():
+    conn = connect_db()
+    if not conn:
+        return
+    c = conn.cursor()
+    c.execute("DELETE FROM top10")
+    conn.commit()
+    c.close()
+    conn.close()
+
+def upsert_top10_token(token_name, price, best_route, is_new, address):
+    conn = connect_db()
+    if not conn:
+        return
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO top10 (token_name, price, best_route, is_new, address)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (token_name, price, best_route, is_new, address))
+    conn.commit()
+    c.close()
+    conn.close()
+
+def load_top10_from_db():
+    conn = connect_db()
+    if not conn:
+        return []
+    c = conn.cursor()
+    c.execute("""
+        SELECT token_name, price, best_route, address, created_at
+        FROM top10
+        ORDER BY id ASC
+    """)
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+
+    out = []
+    for row in rows:
+        tname, price, bro, addr, c_at = row
+        created_str = c_at.strftime("%Y-%m-%d %H:%M:%S") if c_at else ""
+        out.append({
+            "token_name": tname,
+            "price": float(price),
+            "best_route": bro,
+            "address": addr,
+            "created_at": created_str
+        })
+    return out
+
+# --------------------------------------------------
+# FUNZIONI PER TABELLA top10_history
+# --------------------------------------------------
+
+def set_all_inactive_in_history():
+    conn = connect_db()
+    if not conn:
+        return
+    c = conn.cursor()
+    c.execute("UPDATE top10_history SET is_active=0 WHERE is_active=1")
+    conn.commit()
+    c.close()
+    conn.close()
+
+def insert_or_update_history(token_name, price, address):
+    conn = connect_db()
+    if not conn:
+        return
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT id FROM top10_history
+        WHERE token_name=%s AND is_active=1
+    """, (token_name,))
+    row_active = c.fetchone()
+
+    if row_active:
+        c.execute("""
+            UPDATE top10_history
+            SET price=%s, address=%s
+            WHERE id=%s
+        """, (price, address, row_active[0]))
+    else:
+        c.execute("""
+            SELECT id FROM top10_history
+            WHERE token_name=%s
+        """, (token_name,))
+        row_any = c.fetchone()
+        if row_any:
+            c.execute("""
+                UPDATE top10_history
+                SET price=%s, address=%s, is_active=1
+                WHERE id=%s
+            """, (price, address, row_any[0]))
+        else:
+            c.execute("""
+                INSERT INTO top10_history (token_name, price, address, is_active)
+                VALUES (%s, %s, %s, 1)
+            """, (token_name, price, address))
+
+    conn.commit()
+    c.close()
+    conn.close()
+
+# --------------------------------------------------
+# FUNZIONI PER monitored_tokens
+# --------------------------------------------------
+
+def load_monitored_tokens():
+    global monitored_tokens
+    conn = connect_db()
+    if not conn:
+        return
+    c = conn.cursor()
+    c.execute("""
+        SELECT token_name, entry_price, current_price, stoploss,
+               status, max_price, close_gain_loss, mint_address, created_at
+        FROM monitored_tokens
+        ORDER BY id ASC
+    """)
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+
+    for row in rows:
+        tname, entry, curr, stp, st, mxp, cg, mint, c_at = row
+        monitored_tokens[tname] = {
+            "entry": float(entry),
+            "current": float(curr),
+            "stoploss": float(stp),
+            "status": st,
+            "max_price": float(mxp),
+            "close_gain_loss": float(cg),
+            "best_route": "N/A",
+            "mint_address": mint,
+            "created_at": c_at
+        }
+
+def upsert_monitored_token(token_data):
+    tname = token_data["token_name"]
+    entry = token_data["entry"]
+    current = token_data["current"]
+    stoploss = token_data["stoploss"]
+    status = token_data["status"]
+    mxp = token_data["max_price"]
+    cg = token_data["close_gain_loss"]
+    mint = token_data.get("mint_address", None)
+
+    conn = connect_db()
+    if not conn:
+        return
+    c = conn.cursor()
+    c.execute("SELECT id FROM monitored_tokens WHERE token_name=%s", (tname,))
+    row = c.fetchone()
+
+    if row:
+        c.execute("""
+            UPDATE monitored_tokens
+            SET entry_price=%s,
+                current_price=%s,
+                stoploss=%s,
+                status=%s,
+                max_price=%s,
+                close_gain_loss=%s,
+                mint_address=%s
+            WHERE id=%s
+        """, (entry, current, stoploss, status, mxp, cg, mint, row[0]))
+    else:
+        c.execute("""
+            INSERT INTO monitored_tokens (
+                token_name, entry_price, current_price, stoploss,
+                status, max_price, close_gain_loss, mint_address
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (tname, entry, current, stoploss, status, mxp, cg, mint))
+
+    conn.commit()
+    c.close()
+    conn.close()
+
+def delete_monitored_token(token_name):
+    conn = connect_db()
+    if not conn:
+        return
+    c = conn.cursor()
+    c.execute("DELETE FROM monitored_tokens WHERE token_name=%s", (token_name,))
+    conn.commit()
+    c.close()
+    conn.close()
+
+def load_monitored_from_db():
+    conn = connect_db()
+    if not conn:
+        return []
+    c = conn.cursor()
+    c.execute("""
+        SELECT token_name, entry_price, current_price, stoploss,
+               status, max_price, close_gain_loss, mint_address, created_at
+        FROM monitored_tokens
+        ORDER BY id ASC
+    """)
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+
+    out = []
+    for row in rows:
+        tname, entry, curr, stp, st, mxp, cg, mint, c_at = row
+        created_str = c_at.strftime("%Y-%m-%d %H:%M:%S") if c_at else ""
+        out.append({
+            "token_name": tname,
+            "entry": float(entry),
+            "current": float(curr),
+            "stoploss": float(stp),
+            "status": st,
+            "max_price": float(mxp),
+            "close_gain_loss": float(cg),
+            "mint_address": mint,
+            "created_at": created_str
+        })
+    return out
+
+# --------------------------------------------------
+# FUNZIONI DI CONVERSIONE PREZZO
+# --------------------------------------------------
+
+def get_sol_price():
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd", timeout=10)
+        data = r.json()
+        return data["solana"]["usd"]
+    except Exception as e:
+        logging.error(f"Errore nel recupero del prezzo di SOL: {e}")
+        return 0.0
+
+def usd_to_lamports(usd_amount):
+    sol_price_in_usd = get_sol_price()
+    if sol_price_in_usd == 0.0:
+        logging.error("Impossibile convertire USD a Lamports perché il prezzo di SOL non è disponibile.")
+        return 0
+    sol_amount = usd_amount / sol_price_in_usd
+    return int(sol_amount * 1_000_000_000)
+
+# --------------------------------------------------
+# TRAILING STOP E GAIN/LOSS
+# --------------------------------------------------
+
+def calculate_gain_loss(entry, current):
+    if entry == 0:
+        return 0.0
+    return ((current - entry) / entry) * 100
+
+def update_trailing_stop_and_status(token_dict):
+    if token_dict["status"] == "closed":
+        return
+
+    current_price = token_dict["current"]
+    entry_price   = token_dict["entry"]
+    gain_loss     = calculate_gain_loss(entry_price, current_price)
+
+    # 1) perdita >= 50%
+    if gain_loss <= -50:
+        token_dict["status"] = "closed"
+        token_dict["close_gain_loss"] = gain_loss
+        success = sell_token(token_dict["mint_address"], amount_usd=1.0)
+        if success:
+            logging.info(f"Vendita automatica di {token_dict['token_name']} per perdita significativa.")
+            messagebox.showinfo("Vendita Automatica", f"Vendita automatica di {token_dict['token_name']} per perdita significativa.")
+        return
+
+    # 2) trailing se gain >= 0
+    if gain_loss >= 0:
+        if current_price > token_dict["max_price"]:
+            token_dict["max_price"] = current_price
+            potential_sl = token_dict["max_price"] * 0.70
+            if potential_sl > entry_price:
+                token_dict["stoploss"] = potential_sl
+                logging.info(f"Stoploss aggiornato per {token_dict['token_name']} a {token_dict['stoploss']} USD")
+
+    # 3) se current <= stoploss => chiudi
+    if current_price <= token_dict["stoploss"]:
+        token_dict["status"] = "closed"
+        token_dict["close_gain_loss"] = gain_loss
+        success = sell_token(token_dict["mint_address"], amount_usd=1.0)
+        if success:
+            logging.info(f"Vendita automatica di {token_dict['token_name']} a seguito dello stoploss.")
+            messagebox.showinfo("Vendita Automatica", f"Vendita automatica di {token_dict['token_name']} a seguito dello stoploss.")
+
+# --------------------------------------------------
+# QUOTE + is_token_supported
+# --------------------------------------------------
+
+def get_jupiter_swap_quote(input_mint, output_mint, amount, slippage=1):
+    """
+    Ottiene un preventivo di swap da Jupiter (v6/quote).
+    """
+    try:
+        url = "https://quote-api.jup.ag/v6/quote"
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount),          # quantità in lamport
+            "slippageBps": str(int(slippage * 100)),  # slippage in basis points
+            "swapMode": "ExactIn"
+        }
+        headers = {"Accept": "application/json"}
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        quote_response = response.json()
+        logging.info(f"📜 Preventivo ricevuto:\n{json.dumps(quote_response, indent=2)}")
+        return quote_response
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Errore nella richiesta di quote: {e}")
+        return None
+
+def is_token_supported(mint_address: str) -> bool:
+    """
+    Verifica se un token è supportato da Jupiter facendo un quote
+    di 1 USD in SOL -> token e vedendo se esiste almeno 1 route.
+    """
+    try:
+        if not mint_address or len(mint_address) != 44:
+            logging.error(f"❌ Mint Address non valido: {mint_address}")
+            return False
+
+        # Proviamo un quote con 1 USD di SOL
+        input_mint = "So11111111111111111111111111111111111111112"
+        lamports = usd_to_lamports(1.0)
+
+        q = get_jupiter_swap_quote(input_mint, mint_address, lamports, slippage=1)
+        if q and "routePlan" in q and len(q["routePlan"]) > 0:
+            logging.info(f"✅ Il token {mint_address} è supportato da Jupiter.")
+            return True
+        else:
+            logging.warning(f"❌ Il token {mint_address} NON è supportato da Jupiter.")
+            return False
+    except Exception as e:
+        logging.error(f"❌ Errore in is_token_supported: {e}")
+        return False
+
+# --------------------------------------------------
+# FUNZIONI PER TRANS. JUPITER V6
+# --------------------------------------------------
+
+
+def execute_jupiter_swap(input_mint: str, output_mint: str, amount_lamports: int, slippage: float = 1.0) -> Optional[str]:
+    """
+    Esegue un'operazione di swap tramite l'API Jupiter V6 e invia la transazione su Solana.
+
+    Args:
+        input_mint (str): L'indirizzo del token di input.
+        output_mint (str): L'indirizzo del token di output.
+        amount_lamports (int): L'ammontare in lamports da scambiare.
+        slippage (float, optional): Il tasso di slippage consentito (default: 1.0%).
+
+    Returns:
+        Optional[str]: La firma della transazione se lo swap ha successo, altrimenti None.
+    """
+    try:
+        # === 1. Recupera l'ultimo blockhash ===
+        blockhash_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestBlockhash",
+            "params": []
+        }
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(RPC_URL, json=blockhash_payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        blockhash_data = response.json()
+
+        if "result" not in blockhash_data or "value" not in blockhash_data["result"]:
+            logging.error(f"❌ Errore nel recupero del blockhash: {blockhash_data}")
+            return None
+        blockhash = blockhash_data["result"]["value"]["blockhash"]
+        logging.info(f"✅ Blockhash ottenuto: {blockhash}")
+
+        # === 2. Richiedi la Quote di Swap a Jupiter ===
+        quote_url = "https://quote-api.jup.ag/v6/quote"
+        quote_params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount_lamports),
+            "slippageBps": str(int(slippage * 100)),  # Slippage in basis points
+            "swapMode": "ExactIn"
+        }
+        response = requests.get(quote_url, params=quote_params, headers=headers, timeout=10)
+        response.raise_for_status()
+        quote_response = response.json()
+
+        if "routePlan" not in quote_response:
+            logging.error("❌ Errore: quoteResponse non valido!")
+            return None
+        logging.info(f"📜 Quote ricevuta: {json.dumps(quote_response, indent=2)}")
+
+        # === 3. Richiedi la Transazione di Swap da Jupiter ===
+        swap_url = "https://quote-api.jup.ag/v6/swap"
+        swap_payload = {
+            "quoteResponse": quote_response,
+            "userPublicKey": WALLET_ADDRESS,
+            "wrapAndUnwrapSol": True,
+            "asLegacyTransaction": False  # Ottieni VersionedTransaction
+        }
+        response = requests.post(swap_url, headers=headers, json=swap_payload, timeout=10)
+        response.raise_for_status()
+        swap_json = response.json()
+
+        if "swapTransaction" not in swap_json:
+            logging.error("❌ Swap fallito! Nessuna transazione restituita.")
+            return None
+
+        swap_tx_base64 = swap_json["swapTransaction"]
+        logging.info(f"✅ SwapTransaction base64 ricevuta.")
+
+        # === 4. Decodifica, Firma e Invia la Transazione ===
+        tx_bytes = base64.b64decode(swap_tx_base64)
+        versioned_tx = VersionedTransaction.from_bytes(tx_bytes)
+        logging.info("🔍 Transazione deserializzata correttamente.")
+
+        # Firma con il Keypair
+        signed_tx = VersionedTransaction(versioned_tx.message, [sender])
+        logging.info("✅ Transazione firmata correttamente.")
+
+        # Serializza la transazione per l'invio
+        tx_bytes_final = bytes(signed_tx)
+        tx_base64_final = base64.b64encode(tx_bytes_final).decode()
+
+        # === 5. Invia la Transazione sulla Blockchain ===
+        send_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [tx_base64_final, {"encoding": "base64"}]
+        }
+        response = requests.post(RPC_URL, json=send_payload, headers=headers, timeout=10)
+        response.raise_for_status()
+        send_resp = response.json()
+
+        if "result" in send_resp:
+            tx_signature = send_resp["result"]
+            logging.info(f"✅ Transazione inviata con successo! Signature: {tx_signature}")
+            return tx_signature
+        else:
+            logging.error(f"❌ Errore nell'invio della transazione: {send_resp}")
+            return None
+
+    except Exception as e:
+        logging.error(f"❌ Errore in execute_jupiter_swap: {e}")
+        return None
+
+
+# --------------------------------------------------
+#   BUY/SELL (USANDO TRANS. JUPITER V6)
+# --------------------------------------------------
+
+def buy_token(mint_address, amount_usd=1.0):
+    try:
+        # Verifica se il token è supportato
+        if not is_token_supported(mint_address):
+            logging.warning(f"Il token {mint_address} non è supportato da Jupiter.")
+            messagebox.showwarning("Token Non Supportato", f"{mint_address} non è supportato da Jupiter.")
+            return False
+
+        input_mint = "So11111111111111111111111111111111111111112"  # SOL
+        output_mint = mint_address
+        lamports = usd_to_lamports(amount_usd)
+
+        # Esegui lo swap
+        success = execute_jupiter_swap(input_mint, output_mint, lamports, slippage=1)
+        if success:
+            logging.info(f"✅ Acquisto di {amount_usd} USD per {mint_address} eseguito.")
+            return True
+        else:
+            logging.error(f"❌ Acquisto di {amount_usd} USD per {mint_address} fallito.")
+            return False
+
+    except Exception as e:
+        logging.error(f"❌ Errore durante l'acquisto di {mint_address}: {e}")
+        messagebox.showerror("Errore Swap", f"Errore durante l'acquisto del token {mint_address}: {e}")
+        return False
+
+def sell_token(mint_address, amount_usd=1.0):
+    try:
+        if not is_token_supported(mint_address):
+            logging.warning(f"Il token {mint_address} non è supportato da Jupiter.")
+            messagebox.showwarning("Token Non Supportato", f"Il token {mint_address} non è supportato da Jupiter.")
+            return False
+
+        input_mint = mint_address
+        output_mint = "So11111111111111111111111111111111111111112"  # SOL
+        lamports = usd_to_lamports(amount_usd)
+
+        # Esegui lo swap
+        success = execute_jupiter_swap(input_mint, output_mint, lamports, slippage=1)
+        if success:
+            logging.info(f"✅ Vendita di {amount_usd} USD per {mint_address} eseguita.")
+            return True
+        else:
+            logging.error(f"❌ Vendita di {amount_usd} USD per {mint_address} fallita.")
+            return False
+
+    except Exception as e:
+        logging.error(f"❌ Errore durante la vendita di {mint_address}: {e}")
+        messagebox.showerror("Errore Swap", f"Errore durante la vendita del token {mint_address}: {e}")
+        return False
+
+# --------------------------------------------------
+# CHECK WALLET BALANCE
+# --------------------------------------------------
+
+def check_wallet_balance():
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [WALLET_ADDRESS]
+        }
+        headers = {"Content-Type": "application/json"}
+        r = requests.post(RPC_URL, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        resp = r.json()
+
+        if "result" in resp and "value" in resp["result"]:
+            lamports = resp["result"]["value"]
+            sol = lamports / 1_000_000_000
+            print(f"Saldo del wallet: {sol} SOL")
+            return sol
+        else:
+            print("Impossibile recuperare il saldo del wallet dal JSON RPC.")
+            return 0
+    except Exception as e:
+        print(f"Errore nel recupero del saldo del wallet: {e}")
+        return 0
+
+# Esegui la funzione di check saldo
+wallet_balance = check_wallet_balance()
+print(f"Saldo del wallet (in SOL): {wallet_balance}")
+
+# --------------------------------------------------
+# FUNZIONI DI MONITORAGGIO
+# --------------------------------------------------
+
+def add_token_to_monitor(token_name, entry_price, mint_address=None):
+    if token_name in monitored_tokens:
+        messagebox.showinfo("Info", f"Il token {token_name} è già monitorato.")
+        return
+
+    # Se abbiamo mint_address => acquistiamo in legacy mode
+    if mint_address:
+        success = buy_token(mint_address, amount_usd=1.0)
+        if not success:
+            logging.warning(f"Non è stato possibile acquistare {token_name}.")
+            messagebox.showerror("Errore Acquisto", f"Non è stato possibile acquistare {token_name}.")
+            return
+
+    monitored_tokens[token_name] = {
+        "entry": entry_price,
+        "current": entry_price,
+        "stoploss": entry_price * 0.7,
+        "status": "open",
+        "max_price": entry_price,
+        "close_gain_loss": 0.0,
+        "best_route": "N/A",
+        "mint_address": mint_address,
+        "created_at": datetime.now()
+    }
+    upsert_monitored_token({
+        "token_name": token_name,
+        "entry": entry_price,
+        "current": entry_price,
+        "stoploss": entry_price * 0.7,
+        "status": "open",
+        "max_price": entry_price,
+        "close_gain_loss": 0.0,
+        "mint_address": mint_address
+    })
+    update_monitored_tokens()
+    logging.info(f"Token {token_name} aggiunto al monitoraggio.")
+    messagebox.showinfo("Successo", f"Token {token_name} aggiunto al monitoraggio.")
+
+def close_and_sell_selected_token():
+    sel = tree_monitored.selection()
+    if sel:
+        token_name = tree_monitored.item(sel, "values")[0]
+        if token_name in monitored_tokens:
+            mint_address = monitored_tokens[token_name].get("mint_address", None)
+            if not mint_address:
+                messagebox.showerror("Errore", f"Mancanza dell'indirizzo mint per il token {token_name}.")
+                return
+            success = sell_token(mint_address, amount_usd=1.0)
+            if success:
+                monitored_tokens[token_name]["status"] = "closed"
+                monitored_tokens[token_name]["close_gain_loss"] = calculate_gain_loss(
+                    monitored_tokens[token_name]["entry"],
+                    monitored_tokens[token_name]["current"]
+                )
+                upsert_monitored_token({
+                    "token_name": token_name,
+                    "entry": monitored_tokens[token_name]["entry"],
+                    "current": monitored_tokens[token_name]["current"],
+                    "stoploss": monitored_tokens[token_name]["stoploss"],
+                    "status": monitored_tokens[token_name]["status"],
+                    "max_price": monitored_tokens[token_name]["max_price"],
+                    "close_gain_loss": monitored_tokens[token_name]["close_gain_loss"],
+                    "mint_address": monitored_tokens[token_name].get("mint_address", None)
+                })
+                update_monitored_tokens()
+                logging.info(f"Token {token_name} chiuso manualmente.")
+                messagebox.showinfo("Token Chiuso", f"Token {token_name} chiuso manualmente.")
+            else:
+                logging.error(f"Vendita manuale di {token_name} fallita.")
+                messagebox.showerror("Errore Vendita", f"Vendita manuale di {token_name} fallita.")
+
+def update_monitored_tokens():
+    db_data = load_monitored_from_db()
+    for row in tree_monitored.get_children():
+        tree_monitored.delete(row)
+
+    for row in db_data:
+        tname = row["token_name"]
+        entry = row["entry"]
+        curr = row["current"]
+        stp = row["stoploss"]
+        st = row["status"]
+        gain_loss = calculate_gain_loss(entry, curr)
+        c_at = row["created_at"]
+
+        row_tag = ""
+        if st == "closed":
+            if row["close_gain_loss"] >= 0:
+                row_tag = "closed_gain"
+            else:
+                row_tag = "closed_loss"
+
+        tree_monitored.insert(
+            "",
+            tk.END,
+            values=(
+                tname,
+                f"{entry:.2f}",
+                f"{curr:.2f}",
+                f"{gain_loss:.2f}%",
+                f"{stp:.2f}",
+                st,
+                c_at
+            ),
+            tags=(row_tag,)
+        )
+
+    tree_monitored.tag_configure("closed_gain", background="lightgreen")
+    tree_monitored.tag_configure("closed_loss", background="salmon")
+
+def delete_selected_token():
+    sel = tree_monitored.selection()
+    if sel:
+        token_name = tree_monitored.item(sel, "values")[0]
+        if token_name in monitored_tokens:
+            del monitored_tokens[token_name]
+        delete_monitored_token(token_name)
+        tree_monitored.delete(sel)
+        logging.info(f"Token {token_name} eliminato dal monitoraggio.")
+        messagebox.showinfo("Token Eliminato", f"Token {token_name} eliminato dal monitoraggio.")
+
+# --------------------------------------------------
+# FUNZIONE PRINCIPALE DI UPDATE (OGNI X secondi)
+# --------------------------------------------------
+
+def update_trailing_stop_for_all(top10_tokens):
+    name_to_price = {}
+    for item in top10_tokens:
+        token_name = f"{item['name']} ({item['symbol']})"
+        name_to_price[token_name] = item["price"]
+
+    now = datetime.now()
+
+    for tname, data in monitored_tokens.items():
+        if data["status"] == "open":
+            created_at = data.get("created_at", None)
+            if created_at is not None:
+                diff_hours = (now - created_at).total_seconds() / 3600.0
+                if diff_hours >= 24:
+                    data["status"] = "closed"
+                    data["close_gain_loss"] = calculate_gain_loss(data["entry"], data["current"])
+                    success = sell_token(data["mint_address"], amount_usd=1.0)
+                    if success:
+                        upsert_monitored_token({
+                            "token_name": tname,
+                            "entry": data["entry"],
+                            "current": data["current"],
+                            "stoploss": data["stoploss"],
+                            "status": data["status"],
+                            "max_price": data["max_price"],
+                            "close_gain_loss": data["close_gain_loss"],
+                            "mint_address": data["mint_address"]
+                        })
+                        update_monitored_tokens()
+                        logging.info(f"Token {tname} chiuso automaticamente dopo 24 ore.")
+                        messagebox.showinfo("Chiusura Automatica", f"Token {tname} chiuso automaticamente dopo 24 ore.")
+                    else:
+                        logging.error(f"Chiusura automatica di {tname} fallita.")
+                    continue
+
+            if tname in name_to_price:
+                data["current"] = name_to_price[tname]
+
+            update_trailing_stop_and_status(data)
+
+            upsert_monitored_token({
+                "token_name": tname,
+                "entry": data["entry"],
+                "current": data["current"],
+                "stoploss": data["stoploss"],
+                "status": data["status"],
+                "max_price": data["max_price"],
+                "close_gain_loss": data["close_gain_loss"],
+                "mint_address": data["mint_address"]
+            })
+
+def update_data():
+    global first_run
+
+    net_gain = 0.0
+    for tname, data in monitored_tokens.items():
+        if data["status"] == "closed":
+            net_gain += data["close_gain_loss"]
+    balance_label["text"] = f"Saldo: {net_gain:.2f}%"
+
+    try:
+        # Modifica l'URL in base alla fonte dei token trending
+        phantom_url = (
+            "https://api.phantom.app/explore/v2/trending-tokens?"
+            "timeFrame=24h&sortBy=rank&sortDirection=asc&limit=10&rankAlgo=default&chainIds%5B%5D=solana%3A101"
+        )
+        resp = requests.get(phantom_url, timeout=10)
+        resp.raise_for_status()
+        tokens = resp.json().get("items", [])
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Errore nella richiesta a Phantom: {e}")
+        messagebox.showerror("Errore API", f"Errore nella richiesta a Phantom: {e}")
+        tokens = []
+
+    set_all_inactive_in_history()
+    clear_top10()
+
+    for tkn in tokens:
+        token_name = f"{tkn['name']} ({tkn['symbol']})"
+        token_price = tkn["price"]
+        address = tkn["address"]
+        is_new = 1 if token_name not in seen_tokens else 0
+
+        if first_run:
+            seen_tokens.add(token_name)
+        else:
+            if is_new:
+                seen_tokens.add(token_name)
+                add_token_to_monitor(token_name, token_price, address)
+
+        upsert_top10_token(token_name, token_price, "N/A", is_new, address)
+        insert_or_update_history(token_name, token_price, address)
+
+    if first_run:
+        first_run = False
+
+    update_trailing_stop_for_all(tokens)
+    load_top10_into_gui()
+    update_monitored_tokens()
+
+    # Richiama la update_data() tra 2 secondi
+    root.after(2000, update_data)
+
+# --------------------------------------------------
+# GESTIONE GUI TRENDING
+# --------------------------------------------------
+
+def load_top10_into_gui():
+    db_data = load_top10_from_db()
+    for row in tree_trending.get_children():
+        tree_trending.delete(row)
+
+    for item in db_data:
+        token_name = item["token_name"]
+        price = item["price"]
+        best_route = item["best_route"]
+        address = item["address"]
+        c_at = item["created_at"]
+        tag = "new" if token_name not in seen_tokens else "existing"
+
+        tree_trending.insert(
+            "",
+            tk.END,
+            values=(token_name, price, best_route, address, c_at),
+            tags=(tag,)
+        )
+
+    tree_trending.tag_configure("new", background="lightgreen")
+    tree_trending.tag_configure("existing", background="white")
+
+def force_add_selected_token():
+    sel = tree_trending.selection()
+    if sel:
+        row_vals = tree_trending.item(sel, "values")
+        if row_vals:
+            token_name = row_vals[0]
+            try:
+                token_price = float(row_vals[1])
+            except:
+                token_price = 0.0
+            address = row_vals[3]
+            add_token_to_monitor(token_name, token_price, address)
+            update_trailing_stop_for_all([])
+
+# --------------------------------------------------
+# GESTIONE GUI MONITORATI
+# --------------------------------------------------
+
+def load_monitored_into_gui():
+    db_data = load_monitored_from_db()
+    for row in tree_monitored.get_children():
+        tree_monitored.delete(row)
+
+    for row in db_data:
+        tname = row["token_name"]
+        entry = row["entry"]
+        curr = row["current"]
+        stp = row["stoploss"]
+        st = row["status"]
+        gain_loss = calculate_gain_loss(entry, curr)
+        c_at = row["created_at"]
+
+        row_tag = ""
+        if st == "closed":
+            if row["close_gain_loss"] >= 0:
+                row_tag = "closed_gain"
+            else:
+                row_tag = "closed_loss"
+
+        tree_monitored.insert(
+            "",
+            tk.END,
+            values=(tname, f"{entry:.2f}", f"{curr:.2f}",
+                    f"{gain_loss:.2f}%", f"{stp:.2f}", st, c_at),
+            tags=(row_tag,)
+        )
+
+    tree_monitored.tag_configure("closed_gain", background="lightgreen")
+    tree_monitored.tag_configure("closed_loss", background="salmon")
+
+# --------------------------------------------------
+# AVVIO GUI
+# --------------------------------------------------
+
+root = tk.Tk()
+root.title("Token Trading Bot")
+root.geometry("1400x700")
+
+balance_label = ttk.Label(root, text="Saldo: 0.00%")
+balance_label.pack(anchor="n", pady=10)
+
+frame_top10 = ttk.Frame(root)
+frame_top10.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+tree_trending = ttk.Treeview(
+    frame_top10,
+    columns=("Token", "Prezzo", "Best Route", "Address", "Data/Ora Ingresso"),
+    show="headings"
+)
+tree_trending.heading("Token", text="Token")
+tree_trending.heading("Prezzo", text="Prezzo (USD)")
+tree_trending.heading("Best Route", text="Best Route")
+tree_trending.heading("Address", text="Mint Address")
+tree_trending.heading("Data/Ora Ingresso", text="Ingresso top10")
+tree_trending.column("Token", width=250)
+tree_trending.column("Prezzo", width=100)
+tree_trending.column("Best Route", width=200)
+tree_trending.column("Address", width=400)
+tree_trending.column("Data/Ora Ingresso", width=150)
+tree_trending.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+
+scrollbar_trending = ttk.Scrollbar(frame_top10, orient=tk.VERTICAL, command=tree_trending.yview)
+tree_trending.configure(yscroll=scrollbar_trending.set)
+scrollbar_trending.pack(side=tk.LEFT, fill=tk.Y)
+
+btn_buy_monitor = tk.Button(
+    frame_top10,
+    text="Monitor & Buy Token (SOL -> Token)",
+    command=force_add_selected_token
+)
+btn_buy_monitor.pack(side=tk.LEFT, padx=10, pady=10)
+
+frame_monitorati = ttk.Frame(root)
+frame_monitorati.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+tree_monitored = ttk.Treeview(
+    frame_monitorati,
+    columns=("Token", "Entrata", "Attuale", "Gain/Loss%", "Stoploss", "Status", "Data/Ora Ingresso"),
+    show="headings"
+)
+tree_monitored.heading("Token", text="Token")
+tree_monitored.heading("Entrata", text="Entrata (USD)")
+tree_monitored.heading("Attuale", text="Attuale (USD)")
+tree_monitored.heading("Gain/Loss%", text="Gain/Loss%")
+tree_monitored.heading("Stoploss", text="Stoploss (USD)")
+tree_monitored.heading("Status", text="Status")
+tree_monitored.heading("Data/Ora Ingresso", text="Ingresso Monitorato")
+tree_monitored.column("Token", width=250)
+tree_monitored.column("Entrata", width=120)
+tree_monitored.column("Attuale", width=120)
+tree_monitored.column("Gain/Loss%", width=100)
+tree_monitored.column("Stoploss", width=120)
+tree_monitored.column("Status", width=100)
+tree_monitored.column("Data/Ora Ingresso", width=150)
+tree_monitored.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+
+scrollbar_monitored = ttk.Scrollbar(frame_monitorati, orient=tk.VERTICAL, command=tree_monitored.yview)
+tree_monitored.configure(yscroll=scrollbar_monitored.set)
+scrollbar_monitored.pack(side=tk.LEFT, fill=tk.Y)
+
+frame_pulsanti_monitorati = ttk.Frame(frame_monitorati)
+frame_pulsanti_monitorati.pack(side=tk.LEFT, padx=10, pady=10)
+
+btn_sell_close = tk.Button(
+    frame_pulsanti_monitorati,
+    text="Close & Sell Token (Token -> SOL)",
+    command=close_and_sell_selected_token
+)
+btn_sell_close.pack(pady=5)
+
+btn_delete = tk.Button(
+    frame_pulsanti_monitorati,
+    text="Elimina Token Selezionato",
+    command=delete_selected_token
+)
+btn_delete.pack(pady=5)
+
+# Inizializza DB, carica monitorati, carica top10 in GUI
+initialize_db()
+load_monitored_tokens()
+load_top10_into_gui()
+
+# Avvia il loop di aggiornamento
+update_data()
+root.mainloop()

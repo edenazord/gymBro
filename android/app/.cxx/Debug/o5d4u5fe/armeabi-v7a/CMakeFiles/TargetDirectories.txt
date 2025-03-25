@@ -1,0 +1,2 @@
+C:/Users/filip/Documents/Progetti/GymTrainer/gym_training_app/android/app/.cxx/Debug/o5d4u5fe/armeabi-v7a/CMakeFiles/edit_cache.dir
+C:/Users/filip/Documents/Progetti/GymTrainer/gym_training_app/android/app/.cxx/Debug/o5d4u5fe/armeabi-v7a/CMakeFiles/rebuild_cache.dir

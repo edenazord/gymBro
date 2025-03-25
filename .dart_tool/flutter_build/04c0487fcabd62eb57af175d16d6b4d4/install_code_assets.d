@@ -1,0 +1,1 @@
+ C:\\Users\\filip\\Documents\\Progetti\\gymBro\\.dart_tool\\flutter_build\\04c0487fcabd62eb57af175d16d6b4d4\\native_assets.json: 
