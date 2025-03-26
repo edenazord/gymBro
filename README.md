@@ -4,7 +4,7 @@ Benvenuti in **gymBro**, l'app definitiva per il tuo allenamento in palestra!
 
 ## Cos'è gymBro?
 
-**gymBro** è la tuo nuovo compagno di allenamento, progettato per offrirti un'esperienza di palestra personalizzata e coinvolgente. Sia che tu sia un principiante che cerca di iniziare il tuo percorso di fitness o un atleta esperto che desidera ottimizzare i tuoi allenamenti, **gymBro** ha tutto ciò di cui hai bisogno.
+**gymBro** è il tuo nuovo compagno di allenamento, progettato per offrirti un'esperienza di palestra personalizzata e coinvolgente. Sia che tu sia un principiante che cerca di iniziare il tuo percorso di fitness o un atleta esperto che desidera ottimizzare i tuoi allenamenti, **gymBro** ha tutto ciò di cui hai bisogno.
 
 ## Funzionalità Principali
 
